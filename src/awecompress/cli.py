@@ -14,7 +14,7 @@ import aiohttp
 import click
 
 from awecompress import __version__
-from awecompress.config import config_path, db_path, load_config
+from awecompress.config import config_path, load_config
 from awecompress.server import serve as serve_proxy
 from awecompress.store import Store
 
@@ -95,20 +95,25 @@ def config_show() -> None:
 
 
 @cli.command()
+@click.option("--config", "config_file", type=click.Path(), default=None,
+              help="Config file path (default: ~/.config/awecompress/config.json).")
 @click.option("--yes", is_flag=True, help="Delete without asking.")
-def clear(yes: bool) -> None:
+def clear(yes: bool, config_file: str) -> None:
     """Delete stored summaries (sessions start uncompressed)."""
-    path = Path(db_path())
+    cfg = load_config(Path(config_file).expanduser() if config_file else None)
+    path = Path(cfg.db_path)
     if not path.exists():
         click.echo("nothing to clear — no summary store yet")
         return
     if not yes:
-        click.confirm(f"delete {path} (all frozen summaries)?", abort=True)
-    for suffix in ("", "-wal", "-shm"):
-        side = path.with_name(path.name + suffix)
-        if side.exists():
-            side.unlink()
-    click.echo(f"deleted {path}")
+        click.confirm(f"clear {path} (all frozen summaries)?", abort=True)
+    # Clear rows rather than unlink the file: through WAL this also empties
+    # the store a running proxy sees, instead of leaving it on a deleted file.
+    store = Store(path)
+    sessions = store.stats()["sessions"]
+    store.clear()
+    store.close()
+    click.echo(f"cleared {sessions} session(s) from {path}")
 
 
 def main() -> None:

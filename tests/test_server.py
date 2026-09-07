@@ -41,11 +41,13 @@ class Upstream:
     """Stub upstream recording every /v1/messages body it receives."""
     def __init__(self):
         self.bodies = []
+        self.paths = []
 
     def app(self):
         up = web.Application()
 
         async def messages(request):
+            self.paths.append(request.path_qs)
             try:
                 self.bodies.append(await request.json())
             except Exception:
@@ -119,6 +121,14 @@ class TestPassthrough:
         resp = await client.client.get("/v1/models")
         assert resp.status == 200
         assert (await resp.json()) == {"data": [{"id": "m"}]}
+
+    async def test_query_string_preserved(self, client):
+        await client.client.post("/v1/messages?beta=true", json=body_for(
+            [user("hi"), assistant("hello")]))
+        assert client.upstream.paths[-1] == "/v1/messages?beta=true"
+        await client.client.post("/v1/messages/count_tokens?beta=true", json=body_for(
+            [user("hi"), assistant("hello")]))
+        assert client.upstream.paths[-1] == "/v1/messages/count_tokens?beta=true"
 
 
 class TestCompress:

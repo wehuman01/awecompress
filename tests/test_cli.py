@@ -1,10 +1,13 @@
 """CLI surface: help, version, config, clear, status."""
 
+import json
+
 import pytest
 from click.testing import CliRunner
 
 from awecompress import __version__
 from awecompress.cli import cli
+from awecompress.store import SessionRecord, Store
 
 
 @pytest.fixture(autouse=True)
@@ -68,13 +71,34 @@ def test_status_not_running(runner, tmp_config_dir):
     assert "upstream" in out.output
 
 
-def test_clear_removes_store(runner, tmp_config_dir):
+def test_clear_empties_store(runner, tmp_config_dir):
     runner.invoke(cli, ["status"])  # creates the db via Store()
     db = tmp_config_dir / "summaries.db"
     assert db.exists()
+    store = Store(db)
+    store.put(SessionRecord("k1", 8, "h", "frozen summary"))
+    store.close()
     out = runner.invoke(cli, ["clear", "--yes"])
     assert out.exit_code == 0
-    assert not db.exists()
+    assert "1 session" in out.output
+    store = Store(db)
+    assert store.stats()["sessions"] == 0
+    store.close()
+
+
+def test_clear_honors_configured_db_path(runner, tmp_config_dir):
+    custom = tmp_config_dir / "elsewhere.db"
+    store = Store(custom)
+    store.put(SessionRecord("k1", 8, "h", "frozen summary"))
+    store.close()
+    tmp_config_dir.mkdir(parents=True, exist_ok=True)
+    (tmp_config_dir / "config.json").write_text(json.dumps({"dbPath": str(custom)}))
+    out = runner.invoke(cli, ["clear", "--yes"])
+    assert out.exit_code == 0
+    store = Store(custom)
+    assert store.stats()["sessions"] == 0
+    store.close()
+    assert not (tmp_config_dir / "summaries.db").exists()  # default path untouched
 
 
 def test_clear_nothing_to_do(runner, tmp_config_dir):

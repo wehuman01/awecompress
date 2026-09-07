@@ -149,7 +149,9 @@ async def handle_count_tokens(request: web.Request) -> web.StreamResponse:
 async def _proxy(request: web.Request, allow_summary: bool) -> web.StreamResponse:
     session: aiohttp.ClientSession = request.app["session"]
     cfg = request.app["cfg"]
-    path = MESSAGES_PATH if allow_summary else COUNT_TOKENS_PATH
+    # Forward the path the client asked for, query string included (?beta=true
+    # and friends); rewriting to the bare route would silently drop it.
+    path = request.path_qs
 
     raw = await request.read()
     payload = raw
