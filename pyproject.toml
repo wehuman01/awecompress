@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "awecompress"
+version = "0.1.0"
+description = "Context compression proxy: freeze old turns into one summary before they reach your provider."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MPL-2.0" }
+authors = [
+  { name = "Peng" }
+]
+keywords = ["ai", "llm", "proxy", "claude", "claude-code", "context", "compression"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Utilities"
+]
+dependencies = [
+    "click>=8.1",
+    "aiohttp>=3.9",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.23"]
+
+[project.scripts]
+awecompress = "awecompress.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+asyncio_mode = "auto"
