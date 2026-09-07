@@ -1,13 +1,13 @@
 <div align="center">
   <h1>awecompress：上下文压缩代理</h1>
   <p><strong>把旧对话冻结成一份摘要，再送到你的 provider。</strong></p>
-  <p>本地 Anthropic 协议代理。会话历史超过 token 门限时，最旧的整轮对话被替换成一份冻结的 LLM 摘要 —— 结果缓存，之后每个请求复用同样的字节，provider 的 prompt cache 不失效。</p>
+  <p>本地上下文压缩代理，支持 Anthropic Messages、OpenAI Chat Completions 和 OpenAI Responses 三种协议。会话历史超过 token 门限时，最旧的整轮对话被替换成一份冻结的 LLM 摘要 —— 结果缓存，之后每个请求复用同样的字节，provider 的 prompt cache 不失效。</p>
   <p>
     <a href="./README.md">English</a> ·
     <strong>简体中文</strong>
   </p>
   <p>
-    <img src="https://img.shields.io/badge/version-0.1.0-7C3AED?style=flat-square" alt="Version">
+    <img src="https://img.shields.io/badge/version-0.2.0-7C3AED?style=flat-square" alt="Version">
     <img src="https://img.shields.io/badge/python-%E2%89%A53.9-0EA5E9?style=flat-square" alt="Python">
     <img src="https://img.shields.io/badge/license-MPL--2.0-22C55E?style=flat-square" alt="License">
   </p>
@@ -25,7 +25,9 @@
 
 Claude Code 每轮都重发整个对话。几小时后，大部分是死重——旧的文件读取、做完的探索、失败的尝试。
 
-awecompress 卡在 agent 和任何讲 Anthropic Messages 协议的上游之间：
+awecompress 卡在 agent 和讲以下任一协议的上游之间：Anthropic Messages、OpenAI Chat Completions、OpenAI Responses：
+
+Responses API 合法的字符串形式 `input` 会透明转发；只有列表形式才启用压缩，这样轮次边界保持明确。
 
 ```
 Claude Code → awecompress (:8808) → awerouter → 各家 provider
@@ -65,6 +67,9 @@ awecompress serve            # 压缩代理，前台运行
 # Claude Code 从指向 awerouter 改为指向 awecompress
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8808
 claude
+
+# openai-chat / openai-responses 客户端同样可用
+export OPENAI_BASE_URL=http://127.0.0.1:8808/v1
 ```
 
 独立使用，对任何 Anthropic 协议端点：

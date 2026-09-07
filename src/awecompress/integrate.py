@@ -131,6 +131,13 @@ class Compressor:
                       file=sys.stderr)
                 if stored is not None:
                     self._apply(body, stored.summary, stored.upto, protocol)
+                    after_tokens = compress.estimate_body_tokens(
+                        body, adapter.message_list(body), protocol)
+                    return Outcome(
+                        "reuse", p.key, max(0, p.raw_tokens - after_tokens),
+                        f"[awecompress] {p.key}: reused frozen summary after "
+                        f"summary failure — est {p.raw_tokens} -> "
+                        f"{after_tokens} tokens")
                 return None
 
             prev_summary_tokens = compress.estimate_tokens(p.prev_summary)

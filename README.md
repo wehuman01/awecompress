@@ -7,7 +7,7 @@
     <a href="./README_cn.md">简体中文</a>
   </p>
   <p>
-    <img src="https://img.shields.io/badge/version-0.1.0-7C3AED?style=flat-square" alt="Version">
+    <img src="https://img.shields.io/badge/version-0.2.0-7C3AED?style=flat-square" alt="Version">
     <img src="https://img.shields.io/badge/python-%E2%89%A53.9-0EA5E9?style=flat-square" alt="Python">
     <img src="https://img.shields.io/badge/license-MPL--2.0-22C55E?style=flat-square" alt="License">
   </p>
@@ -26,6 +26,8 @@
 Claude Code resubmits the whole conversation every turn. Hours in, most of that is dead weight — old file reads, finished exploration, failed attempts.
 
 awecompress sits between the agent and whatever speaks its protocol upstream — Anthropic Messages, OpenAI Chat Completions, or OpenAI Responses:
+
+Responses requests that use the valid string form of `input` are forwarded transparently; compression requires the list form so turn boundaries remain explicit.
 
 ```
 Claude Code → awecompress (:8808) → awerouter → providers

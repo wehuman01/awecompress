@@ -184,6 +184,27 @@ class TestCompress:
         text = client.upstream.bodies[-1]["messages"][0]["content"][0]["text"]
         assert "merged: SUMMARY#1" in text  # prev summary fed to the merger
 
+    async def test_summary_failure_reuses_existing_frozen_summary(self, client, monkeypatch):
+        body = body_for(big_history())
+        first = await client.client.post("/v1/messages", json=body)
+        assert first.headers["x-awecompress"] == "init"
+        before_calls = client.calls["n"]
+
+        async def boom(*args, **kwargs):
+            raise summarize_mod.SummaryError("upstream summarizer down")
+
+        monkeypatch.setattr(summarize_mod, "summarize", boom)
+        body["messages"] += [user("turn 9 " + "y" * 600),
+                              assistant("reply 9 " + "y" * 600)]
+        resp = await client.client.post("/v1/messages", json=body)
+        assert resp.status == 200
+        assert resp.headers["x-awecompress"] == "reuse"
+        assert client.calls["n"] == before_calls
+        sent = client.upstream.bodies[-1]["messages"]
+        assert compress_mod.SUMMARY_MARKER in sent[0]["content"][0]["text"]
+        assert sent[-1]["content"].startswith("reply 9")
+        assert all("turn 0" not in str(message) for message in sent[1:])
+
     async def test_summary_failure_fails_open(self, tmp_path, monkeypatch):
         upstream = Upstream()
         up_server = TestServer(upstream.app())
@@ -255,6 +276,14 @@ class TestResponses:
             items.append({"type": "message", "role": "assistant",
                           "content": [{"type": "output_text", "text": f"reply {i} " + "x" * 600}]})
         return items
+
+    async def test_string_input_is_transparent(self, client):
+        body = responses_body_for("hello")
+        resp = await client.client.post("/v1/responses", json=body)
+        assert resp.status == 200
+        assert client.upstream.bodies[-1]["input"] == "hello"
+        assert client.calls["n"] == 0
+        assert resp.headers.get("x-awecompress") is None
 
     async def test_compresses(self, client):
         resp = await client.client.post("/v1/responses", json=responses_body_for(self._items()))
