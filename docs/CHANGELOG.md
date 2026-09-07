@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.2.0
+
+Three wire protocols, protected content, and an in-process awerouter mode.
+
+### Highlights
+
+- **Three protocols** — anthropic Messages, openai-chat, and openai-responses
+  histories all compress now (endpoint path picks the shape; per-protocol
+  adapters in `protocols.py`). openai-chat standing system/developer messages
+  are never summarized away — they stay messages ahead of the summary.
+- **Protected content (DCP's Compress idea, proxy-shaped)** — `protectedTools`
+  (default task/skill/todowrite/todoread/updateplan) and
+  `protectedFilePatterns` render uncapped into the summarizer transcript and
+  are marked `[protected]`; the summary prompt demands their content survive
+  verbatim. TodoWrite inputs render in full too — the plan lives in the
+  arguments, not the trivial result.
+- **In-process awerouter mode** — awerouter accepts an `"awecompress"` profile
+  flag (like rtk/odcp) and runs the compression core inside its pipeline,
+  ahead of odcp/rtk: clients keep pointing at the router port, the flag
+  hot-reloads, summary calls go straight to the flash destination (or `pro`,
+  or any provider-declared model via `summaryModel`), and savings land in the
+  usage log (`awecompress_saved`). Requires `pip install awerouter[compress]`;
+  the standalone proxy remains for no-awerouter setups.
+- **Sender injection** — the summary call travels through a host-injected
+  sender (`integrate.Compressor`), so the core owns no URLs and no auth.
+
+## v0.1.0
+
 ## v0.1.0
 
 First release. A local Anthropic-protocol context-compression proxy that

@@ -12,6 +12,8 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from urllib.parse import urlparse
 
+from awecompress.compress import DEFAULT_PROTECTED_TOOLS
+
 DEFAULT_PORT = 8808
 DEFAULT_UPSTREAM = "http://127.0.0.1:20128"  # awerouter's default listen port
 
@@ -24,7 +26,6 @@ DEFAULT_MIN_SPAN_TOKENS = 8000
 DEFAULT_TRANSCRIPT_RESULT_CAP = 4000
 DEFAULT_SUMMARY_MAX_TOKENS = 2048
 DEFAULT_SUMMARY_TIMEOUT_SECONDS = 60
-
 
 def die(message: str) -> "SystemExit":
     raise SystemExit(f"awecompress: {message}")
@@ -56,6 +57,11 @@ class Config:
     summary_model: str = ""
     summary_max_tokens: int = DEFAULT_SUMMARY_MAX_TOKENS
     summary_timeout_seconds: int = DEFAULT_SUMMARY_TIMEOUT_SECONDS
+    # Protected content (see compress.py): these tools' calls and results
+    # render into the summarizer transcript uncapped and must survive the
+    # summary verbatim; file patterns protect path-matching calls the same way.
+    protected_tools: tuple = DEFAULT_PROTECTED_TOOLS
+    protected_file_patterns: tuple = ()
     db_path: str = ""  # empty = db_path() default
 
 
@@ -68,6 +74,8 @@ def _default_file() -> dict:
         "minSpanTokens": DEFAULT_MIN_SPAN_TOKENS,
         "summaryModel": "",
         "summaryMaxTokens": DEFAULT_SUMMARY_MAX_TOKENS,
+        "protectedTools": list(DEFAULT_PROTECTED_TOOLS),
+        "protectedFilePatterns": [],
     }
 
 
@@ -84,6 +92,8 @@ _KEY_MAP = {
     "summaryModel": "summary_model",
     "summaryMaxTokens": "summary_max_tokens",
     "summaryTimeoutSeconds": "summary_timeout_seconds",
+    "protectedTools": "protected_tools",
+    "protectedFilePatterns": "protected_file_patterns",
     "dbPath": "db_path",
 }
 
@@ -92,6 +102,7 @@ _INT_FIELDS = {
     "transcript_result_cap", "summary_max_tokens", "summary_timeout_seconds",
 }
 _STR_FIELDS = {"host", "upstream", "summary_model", "db_path"}
+_LIST_FIELDS = {"protected_tools", "protected_file_patterns"}
 
 
 def load_config(path: "Path | None" = None) -> Config:
@@ -122,6 +133,10 @@ def load_config(path: "Path | None" = None) -> Config:
             elif field in _STR_FIELDS:
                 if not isinstance(val, str):
                     die(f"{path}: '{key}' must be a string")
+            elif field in _LIST_FIELDS:
+                if not isinstance(val, list) or not all(isinstance(v, str) for v in val):
+                    die(f"{path}: '{key}' must be an array of strings")
+                val = tuple(val)
             setattr(cfg, field, val)
 
     _validate(cfg)

@@ -19,7 +19,7 @@
   </p>
 </div>
 
-> 本地代理，压缩 coding agent 的长上下文：旧轮次变成一份冻结摘要，请求变小，会话跑几天不用 `/clear`。
+> 压缩 coding agent 的长上下文：旧轮次变成一份冻结摘要，请求变小，会话跑几天不用 `/clear`。可独立代理运行，也可作为 awerouter 的一个开关进程内运行。
 
 ## 工作原理
 
@@ -85,6 +85,33 @@ awecompress serve --upstream https://api.anthropic.com
 awecompress status
 ```
 
+## 配合 awerouter（进程内，无需代理）
+
+`awerouter` 接受 `awecompress` profile 开关，用法和 `rtk`/`odcp` 完全一致。压缩核心在路由管线内运行——排在 odcp 去重和 rtk 压缩之前——客户端照旧指向路由端口，开关随 `routing.json` 热更新：
+
+```json
+"cc-router-1": {
+  "protocol": "anthropic",
+  "destinations": { "flash": "stepfun,step-3.7-flash", "pro": "glm,glm-5.3" },
+  "odcp": true,
+  "awecompress": true
+}
+```
+
+对象形式可细调——`summaryModel` 决定谁服务摘要调用：`"flash"`（默认，flash 目的地——直接路由，绝不会因长上下文规则被改判 pro）、`"pro"`、或 `providers.json` 里任何 provider 声明过的模型（serve 启动时校验）。其余键与独立配置一致：
+
+```json
+"awecompress": {
+  "summaryModel": "flash",
+  "thresholdTokens": 60000,
+  "keepRecentTurns": 4,
+  "protectedTools": ["task", "skill", "todowrite", "todoread", "updateplan"],
+  "protectedFilePatterns": ["**/*.schema.json"]
+}
+```
+
+需要路由器一侧装上包：`pip install awerouter[compress]`（缺失时开关会让 serve 启动失败并给出该提示）。节省量与 rtk/odcp 并排记入用量日志（`awecompress_saved`，`awerouter usage` 可见）；`X-Awerouter-Token-Saver: off` 一个头关掉所有有损层；冻结存储与独立代理共享（`awecompress status` / `clear` 通用）。
+
 ## 配置
 
 `~/.config/awecompress/config.json`（或 `$AWECOMPRESS_CONFIG_DIR`），首次运行自动写入默认值：
@@ -127,7 +154,7 @@ awecompress clear --yes            # 清空全部冻结摘要
 
 ## 说明与边界
 
-- **仅 Anthropic Messages 协议（v1）。** 其他路径、其他协议原样中继。OpenAI 协议的压缩以后再说。
+- **三种协议** —— Anthropic Messages、OpenAI Chat Completions、OpenAI Responses；其他路径原样中继。
 - **压缩天然有损。** 摘要提示词要求穷尽技术细节、短用户消息逐字保留，但摘要终究是摘要。`keepRecentTurns` 保证工作集原样保留；想要更多原始历史就调大。
 - **会话回退到检查点**（已存摘要之下的历史变了）会通过哈希识别，从头重新压缩。
 - **`/v1/messages/count_tokens`** 只应用已有摘要，绝不触发新的摘要调用。

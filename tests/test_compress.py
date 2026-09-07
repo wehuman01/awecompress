@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from awecompress.compress import (
     SUMMARY_MARKER,
     _is_turn_start,
+    apply_summary,
     estimate_tokens,
     plan,
     prefix_hash,
@@ -15,7 +16,9 @@ from awecompress.compress import (
 )
 from awecompress.store import SessionRecord
 
-CFG = SimpleNamespace(threshold_tokens=1000, keep_recent_turns=2, min_span_tokens=100)
+CFG = SimpleNamespace(threshold_tokens=1000, keep_recent_turns=2, min_span_tokens=100,
+                      transcript_result_cap=100,
+                      protected_tools=("task", "todowrite"), protected_file_patterns=())
 
 
 def user(text):
@@ -126,7 +129,7 @@ class TestRenderTranscript:
             assistant_tool_use("Read", {"file": "a.py"}, "t1"),
             tool_result("t1", "file contents"),
         ]
-        text = render_transcript(msgs, result_cap=100)
+        text = render_transcript(msgs, CFG)
         assert "user: do it" in text
         assert "calls Read" in text
         assert "a.py" in text
@@ -134,20 +137,20 @@ class TestRenderTranscript:
 
     def test_caps_long_results(self):
         msgs = [tool_result("t1", "x" * 500)]
-        text = render_transcript(msgs, result_cap=100)
+        text = render_transcript(msgs, CFG)
         assert "x" * 100 in text
         assert "chars truncated" in text
 
     def test_error_marked(self):
         msgs = [{"role": "user", "content": [
             {"type": "tool_result", "tool_use_id": "t", "is_error": True, "content": "boom"}]}]
-        assert "[error] boom" in render_transcript(msgs, 100)
+        assert "[error] boom" in render_transcript(msgs, SimpleNamespace(transcript_result_cap=100, protected_tools=(), protected_file_patterns=()))
 
     def test_thinking_skipped(self):
         msgs = [{"role": "assistant", "content": [
             {"type": "thinking", "thinking": "internal"},
             {"type": "text", "text": "visible"}]}]
-        text = render_transcript(msgs, 100)
+        text = render_transcript(msgs, SimpleNamespace(transcript_result_cap=100, protected_tools=(), protected_file_patterns=()))
         assert "internal" not in text
         assert "visible" in text
 
@@ -224,3 +227,85 @@ class TestPlan:
 
     def test_non_dict_body(self):
         assert plan(None, None, CFG).action == "passthrough"
+
+
+class TestProtection:
+    """DCP-style protected content: uncapped into the transcript, marked."""
+
+    def cfg(self, tools=("task", "todowrite"), patterns=()):
+        return SimpleNamespace(transcript_result_cap=50, protected_tools=tools,
+                               protected_file_patterns=patterns)
+
+    def test_protected_tool_result_uncapped(self):
+        msgs = [
+            assistant_tool_use("TodoWrite", {"todos": ["a"] * 200}, "t1"),
+            tool_result("t1", "P" * 500),
+        ]
+        text = render_transcript(msgs, self.cfg(), "anthropic")
+        assert "P" * 500 in text            # not capped
+        assert "[protected]" in text
+
+    def test_normal_tool_result_capped(self):
+        msgs = [
+            assistant_tool_use("Read", {"file_path": "a.py"}, "t1"),
+            tool_result("t1", "x" * 500),
+        ]
+        text = render_transcript(msgs, self.cfg(), "anthropic")
+        assert "chars truncated" in text
+        assert "[protected]" not in text
+
+    def test_protected_tool_input_uncapped(self):
+        # TodoWrite's plan lives in its arguments, not its trivial result —
+        # the input must render in full too.
+        plan_args = {"todos": ["step %d" % i for i in range(400)]}
+        msgs = [assistant_tool_use("TodoWrite", plan_args, "t1"),
+                tool_result("t1", "Todos have been modified successfully.")]
+        text = render_transcript(msgs, self.cfg(), "anthropic")
+        assert "step 399" in text
+
+    def test_name_normalization(self):
+        msgs = [
+            assistant_tool_use("todo_write", {}, "t1"),
+            tool_result("t1", "Q" * 300),
+        ]
+        assert "[protected]" in render_transcript(msgs, self.cfg(), "anthropic")
+
+    def test_file_pattern_protects_matching_call(self):
+        msgs = [
+            assistant_tool_use("Read", {"file_path": "db/MIGRATION.sql"}, "t1"),
+            tool_result("t1", "M" * 300),
+        ]
+        cfg = self.cfg(tools=(), patterns=("**/MIGRATION.sql",))
+        text = render_transcript(msgs, cfg, "anthropic")
+        assert "M" * 300 in text
+        assert "[protected]" in text
+
+    def test_file_pattern_non_match_capped(self):
+        msgs = [
+            assistant_tool_use("Read", {"file_path": "src/a.py"}, "t1"),
+            tool_result("t1", "M" * 300),
+        ]
+        cfg = self.cfg(tools=(), patterns=("**/MIGRATION.sql",))
+        assert "chars truncated" in render_transcript(msgs, cfg, "anthropic")
+
+
+class TestOpenAIChatPlan:
+    def big_body(self, turns=6, chunk="x" * 400):
+        messages = [{"role": "system", "content": "standing"}]
+        for i in range(turns):
+            messages.append({"role": "user", "content": f"turn {i} {chunk}"})
+            messages.append({"role": "assistant", "content": f"reply {i} {chunk}"})
+        return {"model": "m", "messages": messages}
+
+    def test_cut_never_lands_in_preamble(self):
+        body = self.big_body()
+        p = plan(body, None, CFG, "openai-chat")
+        assert p.action == "init"
+        assert p.upto == 9               # past the system preamble, keeps last 2 turns
+
+    def test_apply_summary_keeps_preamble(self):
+        body = self.big_body()
+        new = apply_summary(body, "sum text", 9, "openai-chat")
+        assert new[0] == {"role": "system", "content": "standing"}
+        assert SUMMARY_MARKER in new[1]["content"]
+        assert new[2]["content"].startswith("turn 4")

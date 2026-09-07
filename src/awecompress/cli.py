@@ -15,8 +15,8 @@ import click
 
 from awecompress import __version__
 from awecompress.config import config_path, load_config
+from awecompress.integrate import Compressor
 from awecompress.server import serve as serve_proxy
-from awecompress.store import Store
 
 
 @click.group(name="awecompress", context_settings={"help_option_names": ["-h", "--help"]})
@@ -36,9 +36,9 @@ def serve(port: int, host: str, upstream: str, config_file: str) -> None:
     cfg = load_config(Path(config_file).expanduser() if config_file else None)
     if upstream:
         cfg = replace(cfg, upstream=upstream)
-    store = Store(cfg.db_path)
+    compressor = Compressor(cfg.db_path)
     try:
-        asyncio.run(serve_proxy(cfg, store, port, host))
+        asyncio.run(serve_proxy(cfg, compressor, port, host))
     except KeyboardInterrupt:
         pass
 
@@ -60,14 +60,17 @@ def status(config_file: str) -> None:
     except Exception:
         pass
 
-    store = Store(cfg.db_path)
-    stats = store.stats()
-    store.close()
+    compressor = Compressor(cfg.db_path)
+    stats = compressor.stats()
+    compressor.close()
     click.echo(f"awecompress {__version__}")
     click.echo(f"  proxy     : {'running at ' + url if running else 'not running'}")
     click.echo(f"  upstream  : {cfg.upstream}")
     click.echo(f"  compress  : above {cfg.threshold_tokens} est. tokens, "
                f"keep last {cfg.keep_recent_turns} turns, min span {cfg.min_span_tokens}")
+    click.echo(f"  protected : {len(cfg.protected_tools)} tools"
+               + (f", {len(cfg.protected_file_patterns)} file patterns"
+                  if cfg.protected_file_patterns else ""))
     click.echo(f"  summaries : {stats['sessions']} sessions, {stats['calls']} summary calls, "
                f"~{stats['saved_tokens']} tokens saved")
     click.echo(f"  store     : {cfg.db_path}")
@@ -109,10 +112,10 @@ def clear(yes: bool, config_file: str) -> None:
         click.confirm(f"clear {path} (all frozen summaries)?", abort=True)
     # Clear rows rather than unlink the file: through WAL this also empties
     # the store a running proxy sees, instead of leaving it on a deleted file.
-    store = Store(path)
-    sessions = store.stats()["sessions"]
-    store.clear()
-    store.close()
+    compressor = Compressor(path)
+    sessions = compressor.stats()["sessions"]
+    compressor.clear()
+    compressor.close()
     click.echo(f"cleared {sessions} session(s) from {path}")
 
 

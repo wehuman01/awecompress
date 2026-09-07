@@ -1,5 +1,5 @@
-"""aiohttp proxy: transform Anthropic Messages request bodies, relay every
-response byte untouched.
+"""aiohttp proxy: transform request bodies on three wire protocols, relay
+every response byte untouched.
 
 Position in the stack: harness → awecompress → upstream (usually awerouter)
 → provider. Auth headers pass through untouched — awecompress never owns
@@ -7,23 +7,28 @@ credentials; routing and failover stay where they already live. Any failure
 inside the transform path forwards the original body (fail-open): a
 compression problem must never break the session.
 
-v1 speaks Anthropic Messages only. Requests to any other path, or bodies we
-cannot parse, are relayed untouched.
+The planning/replacement/summary machinery lives in integrate.py (shared
+with awerouter's in-process mode); this module only wires it to HTTP.
+
+Protocols served (endpoint path picks the wire shape):
+    anthropic        POST /v1/messages   (+ /v1/messages/count_tokens)
+    openai-chat      POST /v1/chat/completions
+    openai-responses POST /v1/responses
+Anything else relays untouched.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
-import sys
-import time
 from dataclasses import replace
 
 import aiohttp
 from aiohttp import web
 
-from awecompress import __version__, compress, summarize
-from awecompress.store import SessionRecord, Store
+from awecompress import __version__
+from awecompress.integrate import Compressor, Knobs
+from awecompress.protocols import ENDPOINT_PATHS, PROTOCOLS
 
 # Headers forwarded to the upstream. Host/Content-Length/Encoding are
 # hop-by-hop or body-bound and left to aiohttp; everything not listed
@@ -35,6 +40,13 @@ PASS_HEADERS = frozenset({
 
 MESSAGES_PATH = "/v1/messages"
 COUNT_TOKENS_PATH = "/v1/messages/count_tokens"
+
+# Endpoint path -> protocol id for the three transformable routes.
+PATH_PROTOCOLS = {
+    MESSAGES_PATH: "anthropic",
+    "/v1/chat/completions": "openai-chat",
+    "/v1/responses": "openai-responses",
+}
 
 # Claude Code histories run to several MB; the aiohttp default of 1MB would
 # 413 the exact requests this proxy exists to shrink.
@@ -54,84 +66,22 @@ def _upstream_url(cfg, path: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Request transformation
+# Summary sender: one non-streaming call to the upstream, passthrough auth
 # ---------------------------------------------------------------------------
 
-async def _transform(request, body: dict, store: Store, allow_summary: bool):
-    """Apply compression planning to one parsed request body.
+def _make_sender(session: aiohttp.ClientSession, cfg, headers: dict, protocol: str):
+    url = _upstream_url(cfg, ENDPOINT_PATHS[protocol])
+    timeout = aiohttp.ClientTimeout(connect=10, total=cfg.summary_timeout_seconds)
 
-    Returns (messages, mode) — messages is the rewritten list, or None when
-    the body should be forwarded unchanged. Never raises.
-    """
-    cfg = request.app["cfg"]
-    session: aiohttp.ClientSession = request.app["session"]
-    try:
-        stored = store.get(compress.session_key(body))
-        p = compress.plan(body, stored, cfg)
-        if p.action == "passthrough":
-            return None, "passthrough"
+    async def sender(body: dict) -> dict:
+        async with session.post(url, json=body, headers=headers,
+                                timeout=timeout, allow_redirects=False) as resp:
+            if resp.status != 200:
+                detail = (await resp.text())[:200]
+                raise RuntimeError(f"summary call HTTP {resp.status}: {detail}")
+            return await resp.json(content_type=None)
 
-        if p.action == "reuse":
-            print(f"[awecompress] {p.key}: applied frozen summary "
-                  f"(messages 0..{p.upto - 1}) — est {p.raw_tokens} -> {p.body_tokens} tokens")
-            return _replaced(body, stored.summary, p.upto), "reuse"
-
-        # init / extend — one summary call, then freeze the result
-        if not allow_summary:
-            # count_tokens must never mint a new summary (no surprise LLM
-            # calls), but an existing one is applied so counts match.
-            if stored is not None:
-                return _replaced(body, stored.summary, stored.upto), "reuse"
-            return None, "passthrough"
-
-        model = cfg.summary_model or (body.get("model") or "")
-        if not model:
-            return None, "passthrough"
-
-        t0 = time.monotonic()
-        try:
-            summary = await summarize.summarize(
-                session, _upstream_url(cfg, MESSAGES_PATH), _forward_headers(request),
-                model, p.prev_summary, body["messages"][p.base_upto:p.upto], cfg)
-        except summarize.SummaryError as exc:
-            # Fail-open: forward what we already have. With a stored summary
-            # that means reuse (context stays small); without it, the
-            # original body — next request will try again.
-            print(f"[awecompress] {p.key}: summary call failed ({exc}); "
-                  f"{'reusing previous summary' if stored is not None else 'forwarding uncompressed'}",
-                  file=sys.stderr)
-            if stored is not None:
-                return _replaced(body, stored.summary, stored.upto), "reuse"
-            return None, "passthrough"
-
-        prev_summary_tokens = compress.estimate_tokens(p.prev_summary)
-        summary_tokens = compress.estimate_tokens(summary)
-        record = SessionRecord(
-            key=p.key,
-            upto=p.upto,
-            prefix_hash=compress.prefix_hash(body["messages"], p.upto),
-            summary=summary,
-            saved_tokens=(stored.saved_tokens if stored is not None else 0)
-                         + max(0, prev_summary_tokens + p.span_tokens - summary_tokens),
-            calls=(stored.calls if stored is not None else 0) + 1,
-            updated_at=time.time(),
-        )
-        store.put(record)
-        store.log_event(p.key, p.action, p.span_tokens, summary_tokens, model)
-        ms = (time.monotonic() - t0) * 1000
-        replaced = _replaced(body, summary, p.upto)
-        after_tokens = compress.estimate_body_tokens(body, replaced)
-        print(f"[awecompress] {p.key}: {p.action} — summarized messages "
-              f"{p.base_upto}..{p.upto - 1} (est {p.span_tokens} tok) into {summary_tokens} "
-              f"via {model} in {ms:.0f}ms; body est {p.raw_tokens} -> {after_tokens} tokens")
-        return replaced, p.action
-    except Exception as exc:  # noqa: BLE001 — fail-open is the contract
-        print(f"[awecompress] transform error: {exc}", file=sys.stderr)
-        return None, "error"
-
-
-def _replaced(body: dict, summary: str, upto: int) -> list:
-    return [compress.summary_message(summary)] + list(body["messages"][upto:])
+    return sender
 
 
 # ---------------------------------------------------------------------------
@@ -139,16 +89,28 @@ def _replaced(body: dict, summary: str, upto: int) -> list:
 # ---------------------------------------------------------------------------
 
 async def handle_messages(request: web.Request) -> web.StreamResponse:
-    return await _proxy(request, allow_summary=True)
+    return await _proxy(request, "anthropic", allow_summary=True)
 
 
 async def handle_count_tokens(request: web.Request) -> web.StreamResponse:
-    return await _proxy(request, allow_summary=False)
+    # count_tokens must never mint a new summary (no surprise LLM calls),
+    # but an existing one is applied so counts match what gets sent.
+    return await _proxy(request, "anthropic", allow_summary=False)
 
 
-async def _proxy(request: web.Request, allow_summary: bool) -> web.StreamResponse:
+async def handle_chat(request: web.Request) -> web.StreamResponse:
+    return await _proxy(request, "openai-chat", allow_summary=True)
+
+
+async def handle_responses(request: web.Request) -> web.StreamResponse:
+    return await _proxy(request, "openai-responses", allow_summary=True)
+
+
+async def _proxy(request: web.Request, protocol: str,
+                 allow_summary: bool) -> web.StreamResponse:
     session: aiohttp.ClientSession = request.app["session"]
     cfg = request.app["cfg"]
+    compressor: Compressor = request.app["compressor"]
     # Forward the path the client asked for, query string included (?beta=true
     # and friends); rewriting to the bare route would silently drop it.
     path = request.path_qs
@@ -161,13 +123,16 @@ async def _proxy(request: web.Request, allow_summary: bool) -> web.StreamRespons
     except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
         body = None
 
-    if isinstance(body, dict) and isinstance(body.get("messages"), list) \
+    if isinstance(body, dict) and PROTOCOLS[protocol].message_list(body) is not None \
             and request.headers.get("x-awecompress", "").lower() != "off":
-        messages, mode = await _transform(request, body, request.app["store"], allow_summary)
-        if messages is not None:
-            body = dict(body)
-            body["messages"] = messages
+        sender = _make_sender(session, cfg, _forward_headers(request), protocol) \
+            if allow_summary else None
+        outcome = await compressor.transform(body, protocol, cfg.summary_model, sender,
+                                             Knobs.from_config(cfg))
+        if outcome is not None:
+            print(outcome.line)
             payload = json.dumps(body).encode()
+            mode = outcome.action
 
     is_stream = bool(isinstance(body, dict) and body.get("stream"))
     timeout = aiohttp.ClientTimeout(
@@ -191,7 +156,8 @@ async def handle_relay(request: web.Request) -> web.StreamResponse:
     if request.headers.get("content-type"):
         headers.setdefault("content-type", request.headers["content-type"])
     return await _relay(request, session, cfg, request.method, request.path_qs,
-                        raw, headers, aiohttp.ClientTimeout(connect=10, total=None), "passthrough")
+                        raw, headers, aiohttp.ClientTimeout(connect=10, total=None),
+                        "passthrough")
 
 
 async def handle_status(request: web.Request) -> web.Response:
@@ -200,13 +166,13 @@ async def handle_status(request: web.Request) -> web.Response:
         "service": "awecompress",
         "version": __version__,
         "upstream": cfg.upstream,
-        "stats": request.app["store"].stats(),
+        "stats": request.app["compressor"].stats(),
     })
 
 
 async def _relay(request: web.Request, session: aiohttp.ClientSession, cfg,
                  method: str, path: str, payload: bytes, headers: dict,
-                 timeout: aiohttp.ClientTimeout, mode: str) -> web.StreamResponse:
+                 timeout: aiohttp.ClientTimeout, mode: str = "passthrough") -> web.StreamResponse:
     """One upstream request, response bytes streamed back untouched."""
     try:
         up = await session.request(method, _upstream_url(cfg, path), data=payload,
@@ -243,21 +209,23 @@ async def _relay(request: web.Request, session: aiohttp.ClientSession, cfg,
 # App assembly
 # ---------------------------------------------------------------------------
 
-def create_app(cfg, store: Store) -> web.Application:
+def create_app(cfg, compressor: Compressor) -> web.Application:
     app = web.Application(client_max_size=CLIENT_MAX_SIZE)
     app["cfg"] = cfg
-    app["store"] = store
+    app["compressor"] = compressor
     session = aiohttp.ClientSession()
     app["session"] = session
 
     app.router.add_post(MESSAGES_PATH, handle_messages)
     app.router.add_post(COUNT_TOKENS_PATH, handle_count_tokens)
+    app.router.add_post("/v1/chat/completions", handle_chat)
+    app.router.add_post("/v1/responses", handle_responses)
     app.router.add_get("/", handle_status)
     app.router.add_route("*", "/{tail:.*}", handle_relay)
 
     async def on_cleanup(app):
         await session.close()
-        store.close()
+        compressor.close()
     app.on_cleanup.append(on_cleanup)
     return app
 
@@ -266,31 +234,37 @@ def _fmt_tokens(n: int) -> str:
     return f"{n / 1000:.1f}k" if n >= 1000 else str(n)
 
 
-def _banner(cfg, store: Store, port: int) -> None:
-    stats = store.stats()
+def _banner(cfg, compressor: Compressor, port: int) -> None:
+    stats = compressor.stats()
     model = cfg.summary_model or "request model (routed by upstream)"
     print(f"awecompress {__version__} — context compression proxy")
     print(f"  listen    -> http://{cfg.host}:{port}")
     print(f"  upstream  -> {cfg.upstream}")
     print(f"  compress  -> above {_fmt_tokens(cfg.threshold_tokens)} est. tokens; "
           f"keep last {cfg.keep_recent_turns} turns; min span {_fmt_tokens(cfg.min_span_tokens)}")
+    print(f"  protected -> {len(cfg.protected_tools)} tools"
+          + (f", {len(cfg.protected_file_patterns)} file patterns"
+             if cfg.protected_file_patterns else ""))
     print(f"  summaries -> {cfg.db_path} "
           f"({stats['sessions']} sessions, {stats['calls']} summary calls)")
     print(f"  model     -> {model}")
     print()
     print(f"  Claude Code:  export ANTHROPIC_BASE_URL=http://{cfg.host}:{port}")
-    print("  stack with awerouter: point 'upstream' at it — auth and routing stay there")
+    print(f"  openai-chat:  OPENAI_BASE_URL=http://{cfg.host}:{port}/v1")
+    print("  with awerouter: flip the profile 'awecompress' flag and skip this "
+          "proxy entirely (in-process), or point 'upstream' at it")
     print()
 
 
-async def serve(cfg, store: Store, port: "int | None" = None, host: "str | None" = None) -> None:
+async def serve(cfg, compressor: Compressor, port: "int | None" = None,
+                host: "str | None" = None) -> None:
     """Run the proxy in the foreground until Ctrl-C."""
     if port is not None:
         cfg = replace(cfg, port=port)
     if host is not None:
         cfg = replace(cfg, host=host)
 
-    app = create_app(cfg, store)
+    app = create_app(cfg, compressor)
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
     try:
@@ -301,7 +275,7 @@ async def serve(cfg, store: Store, port: "int | None" = None, host: "str | None"
         raise SystemExit(
             f"awecompress: cannot listen on {cfg.host}:{cfg.port} ({exc}) — "
             f"already running? Use --port to pick another.")
-    _banner(cfg, store, cfg.port)
+    _banner(cfg, compressor, cfg.port)
     try:
         await asyncio.Event().wait()
     finally:

@@ -2,7 +2,8 @@
 
 The key property under test: once a session is compressed, the SAME request
 history produces byte-identical bodies every time (frozen summaries — the
-provider prompt cache must not thrash).
+provider prompt cache must not thrash). All three wire protocols run the
+same scenario.
 """
 
 from dataclasses import replace
@@ -12,9 +13,10 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
-from awecompress import server
+from awecompress import compress as compress_mod
+from awecompress import server, summarize as summarize_mod
 from awecompress.config import Config
-from awecompress.store import Store
+from awecompress.integrate import Compressor
 
 # Tiny thresholds so ordinary fixtures cross them; the reused body of the
 # extended session (~930 est. tokens) must also sit above threshold.
@@ -38,7 +40,8 @@ def big_history(turns=6, chunk="x" * 600):
 
 
 class Upstream:
-    """Stub upstream recording every /v1/messages body it receives."""
+    """Stub upstream recording every completion body it receives, on the
+    three protocol paths."""
     def __init__(self):
         self.bodies = []
         self.paths = []
@@ -46,19 +49,26 @@ class Upstream:
     def app(self):
         up = web.Application()
 
-        async def messages(request):
+        async def record(request):
             self.paths.append(request.path_qs)
             try:
                 self.bodies.append(await request.json())
             except Exception:
                 self.bodies.append(None)
+            if request.path == "/v1/chat/completions":
+                return web.json_response({"choices": [{"message": {"content": "upstream reply"}}]})
+            if request.path == "/v1/responses":
+                return web.json_response({"output": [{"type": "message", "content": [
+                    {"type": "output_text", "text": "upstream reply"}]}]})
             return web.json_response({"content": [{"type": "text", "text": "upstream reply"}]})
 
         async def models(request):
             return web.json_response({"data": [{"id": "m"}]})
 
-        up.router.add_post("/v1/messages", messages)
-        up.router.add_post("/v1/messages/count_tokens", messages)
+        up.router.add_post("/v1/messages", record)
+        up.router.add_post("/v1/messages/count_tokens", record)
+        up.router.add_post("/v1/chat/completions", record)
+        up.router.add_post("/v1/responses", record)
         up.router.add_get("/v1/models", models)
         return up
 
@@ -71,15 +81,15 @@ async def client(tmp_path, monkeypatch):
 
     calls = {"n": 0}
 
-    async def fake_summarize(session, url, headers, model, prev_summary, messages, cfg):
+    async def fake_summarize(sender, protocol, model, prev_summary, messages, cfg):
         calls["n"] += 1
         return f"SUMMARY#{calls['n']}" + (f" (merged: {prev_summary})" if prev_summary else "")
 
-    monkeypatch.setattr(server.summarize, "summarize", fake_summarize)
+    monkeypatch.setattr(summarize_mod, "summarize", fake_summarize)
 
     cfg = replace(Config(), upstream=str(up_server.make_url("/")),
                   db_path=str(tmp_path / "summaries.db"), **CFG)
-    app = server.create_app(cfg, Store(cfg.db_path))
+    app = server.create_app(cfg, Compressor(cfg.db_path))
     tc = TestClient(TestServer(app))
     await tc.start_server()
 
@@ -93,6 +103,14 @@ async def client(tmp_path, monkeypatch):
 def body_for(messages):
     return {"model": "claude-x", "system": "be brief", "messages": messages,
             "max_tokens": 100, "stream": False}
+
+
+def chat_body_for(messages):
+    return {"model": "chat-x", "messages": messages, "stream": False}
+
+
+def responses_body_for(items):
+    return {"model": "resp-x", "instructions": "be brief", "input": items, "stream": False}
 
 
 class TestPassthrough:
@@ -139,7 +157,7 @@ class TestCompress:
         assert client.calls["n"] == 1
         sent = client.upstream.bodies[-1]["messages"]
         # One synthetic summary message + the kept recent turns
-        assert sent[0]["content"][0]["text"].startswith(server.compress.SUMMARY_MARKER)
+        assert sent[0]["content"][0]["text"].startswith(compress_mod.SUMMARY_MARKER)
         assert sent[0]["content"][0]["text"].count("SUMMARY#1") == 1
         assert sent[1]["content"].startswith("turn 4")
         # the model and system pass through untouched
@@ -172,12 +190,12 @@ class TestCompress:
         await up_server.start_server()
 
         async def boom(*args, **kwargs):
-            raise server.summarize.SummaryError("upstream summarizer down")
+            raise summarize_mod.SummaryError("upstream summarizer down")
 
-        monkeypatch.setattr(server.summarize, "summarize", boom)
+        monkeypatch.setattr(summarize_mod, "summarize", boom)
         cfg = replace(Config(), upstream=str(up_server.make_url("/")),
                       db_path=str(tmp_path / "s.db"), **CFG)
-        app = server.create_app(cfg, Store(cfg.db_path))
+        app = server.create_app(cfg, Compressor(cfg.db_path))
         tc = TestClient(TestServer(app))
         await tc.start_server()
 
@@ -203,3 +221,47 @@ class TestCompress:
         data = await resp.json()
         assert data["service"] == "awecompress"
         assert data["stats"]["calls"] == 0
+
+
+class TestOpenAIChat:
+    async def test_compresses_and_keeps_system_preamble(self, client):
+        body = chat_body_for([{"role": "system", "content": "standing orders"}]
+                             + big_history())
+        resp = await client.client.post("/v1/chat/completions", json=body)
+        assert resp.status == 200
+        assert resp.headers["x-awecompress"] == "init"
+        assert client.calls["n"] == 1
+        sent = client.upstream.bodies[-1]["messages"]
+        # Standing instructions stay a message; then one summary; then kept turns
+        assert sent[0] == {"role": "system", "content": "standing orders"}
+        assert sent[1]["role"] == "user"
+        assert compress_mod.SUMMARY_MARKER in sent[1]["content"]
+        assert sent[2]["content"].startswith("turn 4")
+
+    async def test_reuse_byte_identical(self, client):
+        body = chat_body_for([{"role": "system", "content": "so"}] + big_history())
+        await client.client.post("/v1/chat/completions", json=body)
+        await client.client.post("/v1/chat/completions", json=body)
+        assert client.calls["n"] == 1
+        assert client.upstream.bodies[-1] == client.upstream.bodies[-2]
+
+
+class TestResponses:
+    def _items(self):
+        items = []
+        for i in range(6):
+            items.append({"type": "message", "role": "user",
+                          "content": [{"type": "input_text", "text": f"turn {i} " + "x" * 600}]})
+            items.append({"type": "message", "role": "assistant",
+                          "content": [{"type": "output_text", "text": f"reply {i} " + "x" * 600}]})
+        return items
+
+    async def test_compresses(self, client):
+        resp = await client.client.post("/v1/responses", json=responses_body_for(self._items()))
+        assert resp.status == 200
+        assert resp.headers["x-awecompress"] == "init"
+        assert client.calls["n"] == 1
+        sent = client.upstream.bodies[-1]["input"]
+        assert sent[0]["type"] == "message" and sent[0]["role"] == "user"
+        assert compress_mod.SUMMARY_MARKER in sent[0]["content"][0]["text"]
+        assert sent[1]["content"][0]["text"].startswith("turn 4")
