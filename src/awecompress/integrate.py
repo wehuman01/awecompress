@@ -96,11 +96,16 @@ class Compressor:
                 return None
 
             stored = self.store.get(compress.session_key(body, protocol))
+            if stored is not None and stored.prefix_hash != compress.prefix_hash(
+                    messages, min(stored.upto, len(messages))):
+                stored = None
             p = compress.plan(body, stored, knobs, protocol)
             if p.action == "passthrough":
                 return None
 
             if p.action == "reuse":
+                if stored is None:
+                    return None
                 self._apply(body, stored.summary, p.upto, protocol)
                 return Outcome("reuse", p.key, p.saved_tokens,
                                f"[awecompress] {p.key}: applied frozen summary "

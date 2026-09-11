@@ -6,6 +6,7 @@ provider prompt cache must not thrash). All three wire protocols run the
 same scenario.
 """
 
+from copy import deepcopy
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -16,7 +17,7 @@ from aiohttp.test_utils import TestClient, TestServer
 from awecompress import compress as compress_mod
 from awecompress import server, summarize as summarize_mod
 from awecompress.config import Config
-from awecompress.integrate import Compressor
+from awecompress.integrate import Compressor, Knobs
 
 # Tiny thresholds so ordinary fixtures cross them; the reused body of the
 # extended session (~930 est. tokens) must also sit above threshold.
@@ -205,6 +206,21 @@ class TestCompress:
         assert sent[-1]["content"].startswith("reply 9")
         assert all("turn 0" not in str(message) for message in sent[1:])
 
+    async def test_summary_failure_after_rewind_forwards_uncompressed(self, client, monkeypatch):
+        body = body_for(big_history())
+        await client.client.post("/v1/messages", json=body)
+
+        async def boom(*args, **kwargs):
+            raise summarize_mod.SummaryError("upstream summarizer down")
+
+        monkeypatch.setattr(summarize_mod, "summarize", boom)
+        body["messages"][2]["content"] = "rewound task " + "z" * 600
+        resp = await client.client.post("/v1/messages", json=body)
+
+        assert resp.status == 200
+        assert resp.headers.get("x-awecompress") is None
+        assert client.upstream.bodies[-1]["messages"] == body["messages"]
+
     async def test_summary_failure_fails_open(self, tmp_path, monkeypatch):
         upstream = Upstream()
         up_server = TestServer(upstream.app())
@@ -236,6 +252,22 @@ class TestCompress:
         # ...but the frozen summary is applied so counts match the real request
         sent = client.upstream.bodies[-1]["messages"]
         assert len(sent) < len(big_history())
+
+    async def test_count_tokens_after_rewind_forwards_uncompressed(self, client):
+        body = body_for(big_history())
+        await client.client.post("/v1/messages", json=body)
+        body["messages"][2]["content"] = "rewound task " + "z" * 600
+        expected_messages = deepcopy(body["messages"])
+        before = client.calls["n"]
+
+        compressor = client.client.server.app["compressor"]
+        outcome = await compressor.transform(
+            body, "anthropic", client.cfg.summary_model, None,
+            Knobs.from_config(client.cfg))
+
+        assert outcome is None
+        assert client.calls["n"] == before
+        assert body["messages"] == expected_messages
 
     async def test_status_endpoint(self, client):
         resp = await client.client.get("/")
