@@ -4,6 +4,14 @@
 
 Three wire protocols, protected content, and an in-process awerouter mode.
 
+### Fixed
+- A stored frozen summary is never spliced onto a rewound or forked history:
+  `transform()` now re-checks the record's `prefix_hash` itself, so a session
+  whose covered prefix changed (checkpoint rewind, fork under the summary)
+  starts over honestly instead of applying a stale summary — including the
+  summary-failure fail-open path and the no-sender `count_tokens` path, both
+  of which previously reused the stale record.
+
 ### Highlights
 
 - **Three protocols** — anthropic Messages, openai-chat, and openai-responses
